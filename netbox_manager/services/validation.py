@@ -2,7 +2,7 @@
 """Validation checks for NetBox data consistency."""
 
 import ipaddress
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from loguru import logger
 import pynetbox
@@ -33,62 +33,9 @@ def validate_ip_addresses_have_prefixes(
             if verbose and idx % 100 == 0:
                 logger.debug(f"Progress: {idx}/{total_ips} IP addresses checked")
 
-            ip_address_str = str(ip_obj.address)
-            ip_vrf = ip_obj.vrf
-            vrf_id = ip_vrf.id if ip_vrf else None
-
-            device_name = None
-            interface_name = None
-            if ip_obj.assigned_object:
-                assigned_obj = ip_obj.assigned_object
-                if hasattr(assigned_obj, "device") and assigned_obj.device:
-                    device_name = assigned_obj.device.name
-                if hasattr(assigned_obj, "name"):
-                    interface_name = assigned_obj.name
-
-            try:
-                ip_network = ipaddress.ip_network(ip_address_str, strict=False)
-            except ValueError as exc:
-                orphaned_ips.append(
-                    {
-                        "address": ip_address_str,
-                        "vrf": str(ip_vrf.name) if ip_vrf else "Global",
-                        "device": device_name,
-                        "interface": interface_name,
-                        "assigned_object": (
-                            str(ip_obj.assigned_object)
-                            if ip_obj.assigned_object
-                            else "Unassigned"
-                        ),
-                        "reason": f"Invalid IP address format: {exc}",
-                    }
-                )
-                continue
-
-            if vrf_id:
-                matching_prefixes = netbox_api.ipam.prefixes.filter(
-                    contains=str(ip_network.network_address), vrf_id=vrf_id
-                )
-            else:
-                matching_prefixes = netbox_api.ipam.prefixes.filter(
-                    contains=str(ip_network.network_address), vrf_id="null"
-                )
-
-            if not matching_prefixes:
-                orphaned_ips.append(
-                    {
-                        "address": ip_address_str,
-                        "vrf": str(ip_vrf.name) if ip_vrf else "Global",
-                        "device": device_name,
-                        "interface": interface_name,
-                        "assigned_object": (
-                            str(ip_obj.assigned_object)
-                            if ip_obj.assigned_object
-                            else "Unassigned"
-                        ),
-                        "reason": "No matching prefix found in same VRF",
-                    }
-                )
+            orphan_issue = _validate_single_ip(netbox_api, ip_obj)
+            if orphan_issue:
+                orphaned_ips.append(orphan_issue)
 
         validation_passed = len(orphaned_ips) == 0
 
@@ -105,6 +52,70 @@ def validate_ip_addresses_have_prefixes(
     except pynetbox.RequestError as exc:
         logger.error(f"NetBox API error during IP-prefix validation: {exc}")
         raise
+
+
+def _validate_single_ip(netbox_api: pynetbox.api, ip_obj: Any) -> Optional[Dict[str, Any]]:
+    """Validate a single IP object's prefix membership."""
+    ip_address_str = str(ip_obj.address)
+    ip_vrf = ip_obj.vrf
+    vrf_id = ip_vrf.id if ip_vrf else None
+
+    device_name = None
+    interface_name = None
+    if ip_obj.assigned_object:
+        assigned_obj = ip_obj.assigned_object
+        if hasattr(assigned_obj, "device") and assigned_obj.device:
+            device_name = assigned_obj.device.name
+        if hasattr(assigned_obj, "name"):
+            interface_name = assigned_obj.name
+
+    try:
+        ip_network = ipaddress.ip_network(ip_address_str, strict=False)
+    except ValueError as exc:
+        return _orphan_issue(
+            ip_address_str,
+            ip_vrf,
+            device_name,
+            interface_name,
+            ip_obj.assigned_object,
+            f"Invalid IP address format: {exc}",
+        )
+
+    matching_prefixes = (
+        netbox_api.ipam.prefixes.filter(contains=str(ip_network.network_address), vrf_id=vrf_id)
+        if vrf_id
+        else netbox_api.ipam.prefixes.filter(contains=str(ip_network.network_address), vrf_id="null")
+    )
+
+    if not matching_prefixes:
+        return _orphan_issue(
+            ip_address_str,
+            ip_vrf,
+            device_name,
+            interface_name,
+            ip_obj.assigned_object,
+            "No matching prefix found in same VRF",
+        )
+    return None
+
+
+def _orphan_issue(
+    address: str,
+    vrf: Any,
+    device: Optional[str],
+    interface: Optional[str],
+    assigned_object: Any,
+    reason: str,
+) -> Dict[str, Any]:
+    """Construct orphan IP record."""
+    return {
+        "address": address,
+        "vrf": str(vrf.name) if vrf else "Global",
+        "device": device,
+        "interface": interface,
+        "assigned_object": str(assigned_object) if assigned_object else "Unassigned",
+        "reason": reason,
+    }
 
 
 def validate_vrf_consistency(
@@ -127,45 +138,9 @@ def validate_vrf_consistency(
             if verbose and idx % 100 == 0:
                 logger.debug(f"Progress: {idx}/{total_ips} VRF IPs checked")
 
-            if not ip_obj.assigned_object:
-                continue
-
-            assigned_obj = ip_obj.assigned_object
-            if not hasattr(assigned_obj, "device") or not assigned_obj.device:
-                continue
-
-            try:
-                interface = netbox_api.dcim.interfaces.get(assigned_obj.id)
-            except Exception as exc:
-                if verbose:
-                    logger.warning(f"Could not retrieve interface {assigned_obj.id}: {exc}")
-                continue
-
-            if not interface:
-                continue
-
-            ip_vrf = ip_obj.vrf
-            interface_vrf = interface.vrf
-
-            ip_vrf_id = ip_vrf.id if ip_vrf else None
-            interface_vrf_id = interface_vrf.id if interface_vrf else None
-
-            if ip_vrf_id != interface_vrf_id:
-                inconsistencies.append(
-                    {
-                        "ip_address": str(ip_obj.address),
-                        "ip_vrf": str(ip_vrf.name) if ip_vrf else "None",
-                        "device": str(interface.device.name),
-                        "interface": str(interface.name),
-                        "interface_vrf": (
-                            str(interface_vrf.name) if interface_vrf else "None"
-                        ),
-                        "reason": (
-                            f"VRF mismatch: IP in '{ip_vrf.name if ip_vrf else 'None'}', "
-                            f"interface in '{interface_vrf.name if interface_vrf else 'None'}'"
-                        ),
-                    }
-                )
+            inconsistency = _check_ip_vrf_consistency(netbox_api, ip_obj, verbose)
+            if inconsistency:
+                inconsistencies.append(inconsistency)
 
         validation_passed = len(inconsistencies) == 0
 
@@ -182,6 +157,49 @@ def validate_vrf_consistency(
     except pynetbox.RequestError as exc:
         logger.error(f"NetBox API error during VRF consistency validation: {exc}")
         raise
+
+
+def _check_ip_vrf_consistency(
+    netbox_api: pynetbox.api, ip_obj: Any, verbose: bool
+) -> Optional[Dict[str, Any]]:
+    """Return inconsistency dict if VRF mismatch is found for a single IP."""
+    if not ip_obj.assigned_object:
+        return None
+
+    assigned_obj = ip_obj.assigned_object
+    if not hasattr(assigned_obj, "device") or not assigned_obj.device:
+        return None
+
+    try:
+        interface = netbox_api.dcim.interfaces.get(assigned_obj.id)
+    except Exception as exc:
+        if verbose:
+            logger.warning(f"Could not retrieve interface {assigned_obj.id}: {exc}")
+        return None
+
+    if not interface:
+        return None
+
+    ip_vrf = ip_obj.vrf
+    interface_vrf = interface.vrf
+
+    ip_vrf_id = ip_vrf.id if ip_vrf else None
+    interface_vrf_id = interface_vrf.id if interface_vrf else None
+
+    if ip_vrf_id == interface_vrf_id:
+        return None
+
+    return {
+        "ip_address": str(ip_obj.address),
+        "ip_vrf": str(ip_vrf.name) if ip_vrf else "None",
+        "device": str(interface.device.name),
+        "interface": str(interface.name),
+        "interface_vrf": str(interface_vrf.name) if interface_vrf else "None",
+        "reason": (
+            f"VRF mismatch: IP in '{ip_vrf.name if ip_vrf else 'None'}', "
+            f"interface in '{interface_vrf.name if interface_vrf else 'None'}'"
+        ),
+    }
 
 
 def run_validation(

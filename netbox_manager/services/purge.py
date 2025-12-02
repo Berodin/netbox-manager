@@ -2,7 +2,7 @@
 """NetBox purge service."""
 
 import concurrent.futures
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from loguru import logger
 import pynetbox
@@ -39,141 +39,14 @@ def purge(
         netbox_api = create_netbox_api()
         logger.info("Starting NetBox purge operation...")
 
-        deletion_order = [
-            ("ipam.ip_addresses", "IP addresses"),
-            ("ipam.fhrp_group_assignments", "FHRP group assignments"),
-            ("dcim.cables", "cables"),
-            ("dcim.mac_addresses", "MAC addresses"),
-            ("dcim.interfaces", "interfaces"),
-            ("dcim.console_server_ports", "console server ports"),
-            ("dcim.console_ports", "console ports"),
-            ("dcim.power_outlets", "power outlets"),
-            ("dcim.power_ports", "power ports"),
-            ("dcim.device_bays", "device bays"),
-            ("dcim.inventory_items", "inventory items"),
-            ("dcim.devices", "devices"),
-            ("dcim.virtual_chassis", "virtual chassis"),
-            ("dcim.device_types", "device types"),
-            ("dcim.module_types", "module types"),
-            ("virtualization.clusters", "clusters"),
-            ("virtualization.cluster_types", "cluster types"),
-            ("ipam.fhrp_groups", "FHRP groups"),
-            ("ipam.prefixes", "prefixes"),
-            ("ipam.vlans", "VLANs"),
-            ("ipam.vlan_groups", "VLAN groups"),
-            ("ipam.vrfs", "VRFs"),
-            ("dcim.racks", "racks"),
-            ("dcim.locations", "locations"),
-            ("dcim.sites", "sites"),
-            ("organization.tenants", "tenants"),
-            ("extras.config_contexts", "config contexts"),
-            ("dcim.manufacturers", "manufacturers"),
-        ]
-
-        if limit:
-            normalized_limit = limit.replace("-", "_").replace(".", "_")
-            deletion_order = [
-                (api_path, name)
-                for api_path, name in deletion_order
-                if normalized_limit in api_path.replace(".", "_")
-            ]
-            if not deletion_order:
-                logger.error(f"No resource type matching '{limit}' found")
-                raise typer.Exit(1)
-
-        if exclude_core:
-            core_resources = ["sites", "locations", "tenants", "racks"]
-            deletion_order = [
-                (api_path, name)
-                for api_path, name in deletion_order
-                if not any(core in name for core in core_resources)
-            ]
-
-        total_deleted = 0
-        errors: List[str] = []
-
-        for api_path, resource_name in deletion_order:
-            try:
-                api_parts = api_path.split(".")
-                endpoint = netbox_api
-                for part in api_parts:
-                    endpoint = getattr(endpoint, part)
-
-                resources = list(endpoint.all())
-
-                if not resources:
-                    if verbose:
-                        logger.info(f"No {resource_name} found to delete")
-                    else:
-                        logger.debug(f"No {resource_name} found to delete")
-                    continue
-
-                if dryrun:
-                    logger.info(f"Would delete {len(resources)} {resource_name}")
-                    if verbose:
-                        for resource in resources:
-                            name_attr = get_resource_name(resource)
-                            logger.info(f"  Would delete {resource_name}: {name_attr}")
-                    else:
-                        for resource in resources[:5]:
-                            name_attr = get_resource_name(resource)
-                            logger.debug(f"  - {name_attr}")
-                        if len(resources) > 5:
-                            logger.debug(f"  ... and {len(resources) - 5} more")
-                    continue
-
-                if verbose:
-                    logger.info(f"Deleting {len(resources)} {resource_name}...")
-
-                deleted_count = 0
-
-                if api_path in ["users.users", "users.tokens", "auth.tokens"]:
-                    continue
-
-                def delete_resource(resource: Any) -> Tuple[bool, Optional[str]]:
-                    try:
-                        name_attr = get_resource_name(resource)
-
-                        if verbose:
-                            logger.info(f"  Deleting {resource_name}: {name_attr}")
-
-                        resource.delete()
-                        return True, None
-                    except Exception as exc:
-                        name_attr = get_resource_name(resource)
-                        error_msg = (
-                            f"Failed to delete {resource_name} '{name_attr}': {exc}"
-                        )
-                        if verbose:
-                            logger.warning(error_msg)
-                        else:
-                            logger.debug(error_msg)
-                        return False, f"{resource_name} '{name_attr}': {exc}"
-
-                with concurrent.futures.ThreadPoolExecutor(
-                    max_workers=parallel
-                ) as executor:
-                    futures = [
-                        executor.submit(delete_resource, resource)
-                        for resource in resources
-                    ]
-
-                    for future in concurrent.futures.as_completed(futures):
-                        success, error = future.result()
-                        if success:
-                            deleted_count += 1
-                        elif error:
-                            errors.append(error)
-
-                if deleted_count > 0:
-                    logger.info(f"Deleted {deleted_count} {resource_name}")
-                    total_deleted += deleted_count
-
-            except AttributeError:
-                logger.debug(f"API endpoint {api_path} not found, skipping")
-            except Exception as exc:
-                logger.error(f"Error processing {resource_name}: {exc}")
-                errors.append(f"{resource_name}: {exc}")
+        deletion_order = build_deletion_order(limit, exclude_core)
+        total_deleted, errors = execute_deletions(
+            netbox_api,
+            deletion_order,
+            dryrun=dryrun,
+            parallel=parallel,
+            verbose=verbose,
+        )
 
         if dryrun:
             logger.info("Dry run complete - no resources were deleted")
@@ -194,3 +67,174 @@ def purge(
         logger.error(f"Error during purge: {exc}")
         raise typer.Exit(1)
 
+
+def build_deletion_order(
+    limit: Optional[str], exclude_core: bool
+) -> List[Tuple[str, str]]:
+    """Build ordered list of resource endpoints to delete."""
+    base_order: List[Tuple[str, str]] = [
+        ("ipam.ip_addresses", "IP addresses"),
+        ("ipam.fhrp_group_assignments", "FHRP group assignments"),
+        ("dcim.cables", "cables"),
+        ("dcim.mac_addresses", "MAC addresses"),
+        ("dcim.interfaces", "interfaces"),
+        ("dcim.console_server_ports", "console server ports"),
+        ("dcim.console_ports", "console ports"),
+        ("dcim.power_outlets", "power outlets"),
+        ("dcim.power_ports", "power ports"),
+        ("dcim.device_bays", "device bays"),
+        ("dcim.inventory_items", "inventory items"),
+        ("dcim.devices", "devices"),
+        ("dcim.virtual_chassis", "virtual chassis"),
+        ("dcim.device_types", "device types"),
+        ("dcim.module_types", "module types"),
+        ("virtualization.clusters", "clusters"),
+        ("virtualization.cluster_types", "cluster types"),
+        ("ipam.fhrp_groups", "FHRP groups"),
+        ("ipam.prefixes", "prefixes"),
+        ("ipam.vlans", "VLANs"),
+        ("ipam.vlan_groups", "VLAN groups"),
+        ("ipam.vrfs", "VRFs"),
+        ("dcim.racks", "racks"),
+        ("dcim.locations", "locations"),
+        ("dcim.sites", "sites"),
+        ("organization.tenants", "tenants"),
+        ("extras.config_contexts", "config contexts"),
+        ("dcim.manufacturers", "manufacturers"),
+    ]
+
+    if limit:
+        normalized_limit = limit.replace("-", "_").replace(".", "_")
+        base_order = [
+            (api_path, name)
+            for api_path, name in base_order
+            if normalized_limit in api_path.replace(".", "_")
+        ]
+        if not base_order:
+            logger.error(f"No resource type matching '{limit}' found")
+            raise typer.Exit(1)
+
+    if exclude_core:
+        core_resources = ["sites", "locations", "tenants", "racks"]
+        base_order = [
+            (api_path, name)
+            for api_path, name in base_order
+            if not any(core in name for core in core_resources)
+        ]
+
+    return base_order
+
+
+def execute_deletions(
+    netbox_api: Any,
+    deletion_order: Iterable[Tuple[str, str]],
+    dryrun: bool,
+    parallel: int,
+    verbose: bool,
+) -> Tuple[int, List[str]]:
+    """Execute deletions against NetBox according to the provided order."""
+    total_deleted = 0
+    errors: List[str] = []
+
+    for api_path, resource_name in deletion_order:
+        try:
+            resources = list(resolve_endpoint(netbox_api, api_path).all())
+            if not resources:
+                log_none_found(verbose, resource_name)
+                continue
+
+            if dryrun:
+                log_dryrun(resources, resource_name, verbose)
+                continue
+
+            if verbose:
+                logger.info(f"Deleting {len(resources)} {resource_name}...")
+
+            deleted_count, deletion_errors = delete_resources_parallel(
+                resources, resource_name, parallel, verbose
+            )
+            total_deleted += deleted_count
+            errors.extend(deletion_errors)
+        except AttributeError:
+            logger.debug(f"API endpoint {api_path} not found, skipping")
+        except Exception as exc:
+            logger.error(f"Error processing {resource_name}: {exc}")
+            errors.append(f"{resource_name}: {exc}")
+
+    return total_deleted, errors
+
+
+def resolve_endpoint(netbox_api: Any, api_path: str) -> Any:
+    """Resolve dotted API path to an endpoint."""
+    endpoint = netbox_api
+    for part in api_path.split("."):
+        endpoint = getattr(endpoint, part)
+    return endpoint
+
+
+def log_none_found(verbose: bool, resource_name: str) -> None:
+    """Log when no resources are found."""
+    if verbose:
+        logger.info(f"No {resource_name} found to delete")
+    else:
+        logger.debug(f"No {resource_name} found to delete")
+
+
+def log_dryrun(resources: List[Any], resource_name: str, verbose: bool) -> None:
+    """Log dry-run information."""
+    logger.info(f"Would delete {len(resources)} {resource_name}")
+    if verbose:
+        for resource in resources:
+            name_attr = get_resource_name(resource)
+            logger.info(f"  Would delete {resource_name}: {name_attr}")
+        return
+
+    for resource in resources[:5]:
+        name_attr = get_resource_name(resource)
+        logger.debug(f"  - {name_attr}")
+    if len(resources) > 5:
+        logger.debug(f"  ... and {len(resources) - 5} more")
+
+
+def delete_resources_parallel(
+    resources: List[Any],
+    resource_name: str,
+    parallel: int,
+    verbose: bool,
+) -> Tuple[int, List[str]]:
+    """Delete resources in parallel, returning count and errors."""
+    deleted_count = 0
+    errors: List[str] = []
+
+    if not resources or resource_name in ["users.users", "users.tokens", "auth.tokens"]:
+        return deleted_count, errors
+
+    def delete_resource(resource: Any) -> Tuple[bool, Optional[str]]:
+        try:
+            name_attr = get_resource_name(resource)
+            if verbose:
+                logger.info(f"  Deleting {resource_name}: {name_attr}")
+            resource.delete()
+            return True, None
+        except Exception as exc:
+            name_attr = get_resource_name(resource)
+            error_msg = f"Failed to delete {resource_name} '{name_attr}': {exc}"
+            if verbose:
+                logger.warning(error_msg)
+            else:
+                logger.debug(error_msg)
+            return False, error_msg
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
+        futures = [executor.submit(delete_resource, resource) for resource in resources]
+        for future in concurrent.futures.as_completed(futures):
+            success, error = future.result()
+            if success:
+                deleted_count += 1
+            elif error:
+                errors.append(error)
+
+    if deleted_count > 0:
+        logger.info(f"Deleted {deleted_count} {resource_name}")
+
+    return deleted_count, errors

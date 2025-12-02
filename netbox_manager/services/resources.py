@@ -10,7 +10,7 @@ import tempfile
 import time
 from copy import deepcopy
 from itertools import groupby
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import ansible_runner
 import git
@@ -43,24 +43,11 @@ def build_inventory() -> Dict[str, Any]:
     return inv
 
 
-def handle_file(
-    file: str,
-    dryrun: bool,
-    task_filter: Optional[str] = None,
-    device_filters: Optional[List[str]] = None,
-    fail_fast: bool = False,
-    show_playbooks: bool = False,
-    verbose: bool = False,
-    ignore_errors: bool = False,
-) -> None:
-    """Process a single YAML resource file and execute corresponding Ansible playbook."""
-    template_vars = load_global_vars()
-    template_tasks = []
-
-    logger.info(f"Handle file {file}")
+def _load_yaml(file: str, fail_fast: bool) -> Optional[Any]:
+    """Load YAML content from a file with defensive error handling."""
     try:
         with open(file) as fp:
-            data = yaml.safe_load(fp)
+            return yaml.safe_load(fp)
     except yaml.YAMLError as exc:
         error_msg = f"Invalid YAML syntax in file '{file}'"
         if hasattr(exc, "problem_mark"):
@@ -71,96 +58,138 @@ def handle_file(
         if hasattr(exc, "context"):
             error_msg += f" ({exc.context})"
         logger.error(error_msg)
-        if fail_fast:
-            raise typer.Exit(1)
-        return
     except FileNotFoundError:
         logger.error(f"File not found: {file}")
-        if fail_fast:
-            raise typer.Exit(1)
-        return
     except Exception as exc:  # pragma: no cover - defensive
         logger.error(f"Error reading file '{file}': {exc}")
-        if fail_fast:
-            raise typer.Exit(1)
-        return
 
+    if fail_fast:
+        raise typer.Exit(1)
+    return None
+
+
+def _validate_yaml_structure(file: str, data: Any, fail_fast: bool) -> bool:
+    """Ensure YAML content is a list and not empty."""
     if data is None:
         logger.warning(f"File '{file}' is empty or contains only comments")
-        return
-
+        return False
     if not isinstance(data, list):
         logger.error(
             f"Invalid YAML structure in file '{file}': Expected a list of tasks, got {type(data).__name__}"
         )
         if fail_fast:
             raise typer.Exit(1)
-        return
+        return False
+    return True
 
-    try:
-        for idx, rtask in enumerate(data):
-            if not isinstance(rtask, dict):
-                logger.error(
-                    f"Invalid task structure in file '{file}' at index {idx}: Expected a dictionary, got {type(rtask).__name__}"
+
+def _apply_filters(
+    key: str,
+    value: Dict[str, Any],
+    task_filter: Optional[str],
+    device_filters: Optional[List[str]],
+) -> bool:
+    """Return True if the task should be skipped due to filters."""
+    if task_filter and should_skip_task_by_filter(key, task_filter):
+        logger.debug(f"Skipping task of type '{key}' (filter: {task_filter})")
+        return True
+
+    if device_filters:
+        device_names = extract_device_names_from_task(key, value)
+        if should_skip_task_by_device_filter(device_names, device_filters):
+            if device_names:
+                logger.debug(
+                    f"Skipping task with devices '{device_names}' (device filters: {device_filters})"
                 )
-                if fail_fast:
-                    raise typer.Exit(1)
-                continue
-
-            if not rtask:
-                logger.warning(f"Empty task in file '{file}' at index {idx}, skipping")
-                continue
-
-            register_var = rtask.pop("register", None)
-
-            try:
-                key, value = next(iter(rtask.items()))
-            except StopIteration:
-                logger.warning(
-                    f"Task in file '{file}' at index {idx} has no content after removing 'register' field, skipping"
-                )
-                continue
-
-            if key == "vars":
-                template_vars = deep_merge(template_vars, value)
-            elif key == "debug":
-                task = {"ansible.builtin.debug": value}
-                if register_var:
-                    task["register"] = register_var
-                if ignore_errors:
-                    task["ignore_errors"] = True
-                template_tasks.append(task)
-            elif key == "uri":
-                task = create_uri_task(value, register_var, ignore_errors)
-                template_tasks.append(task)
             else:
-                if task_filter and should_skip_task_by_filter(key, task_filter):
-                    logger.debug(
-                        f"Skipping task of type '{key}' (filter: {task_filter})"
-                    )
-                    continue
+                logger.debug(
+                    f"Skipping task of type '{key}' with no device reference (device filters active)"
+                )
+            return True
+    return False
 
-                if device_filters:
-                    device_names = extract_device_names_from_task(key, value)
-                    if should_skip_task_by_device_filter(device_names, device_filters):
-                        if device_names:
-                            logger.debug(
-                                f"Skipping task with devices '{device_names}' (device filters: {device_filters})"
-                            )
-                        else:
-                            logger.debug(
-                                f"Skipping task of type '{key}' with no device reference (device filters active)"
-                            )
-                        continue
 
-                task = create_netbox_task(key, value, register_var, ignore_errors)
-                template_tasks.append(task)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.error(f"Error processing tasks in file '{file}': {exc}")
-        if fail_fast:
-            raise typer.Exit(1)
-        return
+def _build_task_from_entry(
+    key: str,
+    value: Dict[str, Any],
+    register_var: Optional[str],
+    ignore_errors: bool,
+    task_filter: Optional[str],
+    device_filters: Optional[List[str]],
+) -> Optional[Dict[str, Any]]:
+    """Create a single Ansible task entry from YAML input."""
+    if key == "vars":
+        return {"vars": value}
+    if key == "debug":
+        task: Dict[str, Any] = {"ansible.builtin.debug": value}
+        if register_var:
+            task["register"] = register_var
+        if ignore_errors:
+            task["ignore_errors"] = True
+        return task
+    if key == "uri":
+        return create_uri_task(value, register_var, ignore_errors)
 
+    if _apply_filters(key, value, task_filter, device_filters):
+        return None
+
+    return create_netbox_task(key, value, register_var, ignore_errors)
+
+
+def _gather_tasks_from_data(
+    data: List[Dict[str, Any]],
+    task_filter: Optional[str],
+    device_filters: Optional[List[str]],
+    ignore_errors: bool,
+    fail_fast: bool,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Convert YAML list into vars + tasks while applying filters."""
+    template_vars = load_global_vars()
+    template_tasks: List[Dict[str, Any]] = []
+
+    for idx, rtask in enumerate(data):
+        if not isinstance(rtask, dict):
+            logger.error(
+                f"Invalid task structure in YAML at index {idx}: Expected a dictionary, got {type(rtask).__name__}"
+            )
+            if fail_fast:
+                raise typer.Exit(1)
+            continue
+        if not rtask:
+            logger.warning(f"Empty task in YAML at index {idx}, skipping")
+            continue
+
+        register_var = rtask.pop("register", None)
+        try:
+            key, value = next(iter(rtask.items()))
+        except StopIteration:
+            logger.warning(
+                f"Task at index {idx} has no content after removing 'register' field, skipping"
+            )
+            continue
+
+        task_entry = _build_task_from_entry(
+            key, value, register_var, ignore_errors, task_filter, device_filters
+        )
+        if task_entry:
+            if task_entry.get("vars"):
+                template_vars = deep_merge(template_vars, task_entry["vars"])
+            elif key != "vars":
+                template_tasks.append(task_entry)
+
+    return template_tasks, template_vars
+
+
+def _run_playbook_for_file(
+    file: str,
+    template_vars: Dict[str, Any],
+    template_tasks: List[Dict[str, Any]],
+    dryrun: bool,
+    show_playbooks: bool,
+    fail_fast: bool,
+    verbose: bool,
+) -> None:
+    """Render and execute (or show) the playbook for a file."""
     if not template_tasks:
         logger.info(f"No tasks to execute in {file} after filtering")
         return
@@ -183,25 +212,60 @@ def handle_file(
 
         if dryrun:
             logger.info(f"Skip the execution of {file} as only one dry run")
-        else:
-            verbosity = 3 if verbose else None
-            result = ansible_runner.run(
-                playbook=temp_file.name,
-                private_data_dir=temp_dir,
-                inventory=build_inventory(),
-                cancel_callback=lambda: None,
-                verbosity=verbosity,
-                envvars={
-                    "ANSIBLE_STDOUT_CALLBACK": "ansible.builtin.default",
-                    "ANSIBLE_CALLBACKS_ENABLED": "ansible.builtin.default",
-                    "ANSIBLE_STDOUT_CALLBACK_RESULT_FORMAT": "yaml",
-                },
+            return
+
+        verbosity = 3 if verbose else None
+        result = ansible_runner.run(
+            playbook=temp_file.name,
+            private_data_dir=temp_dir,
+            inventory=build_inventory(),
+            cancel_callback=lambda: None,
+            verbosity=verbosity,
+            envvars={
+                "ANSIBLE_STDOUT_CALLBACK": "ansible.builtin.default",
+                "ANSIBLE_CALLBACKS_ENABLED": "ansible.builtin.default",
+                "ANSIBLE_STDOUT_CALLBACK_RESULT_FORMAT": "yaml",
+            },
+        )
+        if fail_fast and result.status == "failed":
+            logger.error(
+                f"Ansible playbook failed for {file}. Exiting due to --fail option."
             )
-            if fail_fast and result.status == "failed":
-                logger.error(
-                    f"Ansible playbook failed for {file}. Exiting due to --fail option."
-                )
-                raise typer.Exit(1)
+            raise typer.Exit(1)
+
+
+def handle_file(
+    file: str,
+    dryrun: bool,
+    task_filter: Optional[str] = None,
+    device_filters: Optional[List[str]] = None,
+    fail_fast: bool = False,
+    show_playbooks: bool = False,
+    verbose: bool = False,
+    ignore_errors: bool = False,
+) -> None:
+    """Process a single YAML resource file and execute corresponding Ansible playbook."""
+    logger.info(f"Handle file {file}")
+    data = _load_yaml(file, fail_fast)
+    if not _validate_yaml_structure(file, data, fail_fast):
+        return
+
+    template_tasks, template_vars = _gather_tasks_from_data(
+        data,
+        task_filter=task_filter,
+        device_filters=device_filters,
+        ignore_errors=ignore_errors,
+        fail_fast=fail_fast,
+    )
+    _run_playbook_for_file(
+        file=file,
+        template_vars=template_vars,
+        template_tasks=template_tasks,
+        dryrun=dryrun,
+        show_playbooks=show_playbooks,
+        fail_fast=fail_fast,
+        verbose=verbose,
+    )
 
 
 def process_device_and_module_types(

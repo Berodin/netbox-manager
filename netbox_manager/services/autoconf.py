@@ -4,6 +4,7 @@
 import ipaddress
 import os
 import re
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from loguru import logger
@@ -20,6 +21,13 @@ from netbox_manager.config import (
 from netbox_manager.logging_utils import init_logger
 from netbox_manager.netbox.api import create_netbox_api, get_device_role_slug
 from netbox_manager.utils.yaml_utils import ProperIndentDumper
+
+
+@dataclass
+class ClusterConfig:
+    ipv4_network: ipaddress.IPv4Network
+    ipv6_network: Optional[ipaddress.IPv6Network]
+    offset: int = 0
 
 
 def has_sonic_hwsku_parameter(device: Any) -> bool:
@@ -72,13 +80,13 @@ def should_have_loopback_interface(device: Any) -> bool:
     return False
 
 
-def generate_loopback_interfaces() -> List[Dict[str, Any]]:
+def generate_loopback_interfaces(netbox_api: Optional[Any] = None) -> List[Dict[str, Any]]:
     """Generate Loopback0 interfaces for eligible devices that don't have them."""
+    api = netbox_api or create_netbox_api()
     tasks = []
-    netbox_api = create_netbox_api()
 
     logger.info("Analyzing devices for Loopback0 interface creation...")
-    all_devices = netbox_api.dcim.devices.all()
+    all_devices = api.dcim.devices.all()
 
     for device in all_devices:
         if should_have_loopback_interface(device):
@@ -150,6 +158,44 @@ def _get_cluster_segment_config_context(
         return {}
 
 
+def parse_cluster_config(
+    config_context: Dict[str, Any], cluster_name: str
+) -> Optional[ClusterConfig]:
+    """Return parsed cluster config or None if required data is missing/invalid."""
+    loopback_ipv4_network = config_context.get("_segment_loopback_network_ipv4")
+    loopback_ipv6_network = config_context.get("_segment_loopback_network_ipv6")
+    loopback_offset_ipv4 = config_context.get("_segment_loopback_offset_ipv4", 0)
+
+    if not loopback_ipv4_network:
+        logger.info(
+            f"Cluster '{cluster_name}' has no _segment_loopback_network_ipv4 in config context, skipping"
+        )
+        return None
+
+    try:
+        ipv4_network = ipaddress.IPv4Network(loopback_ipv4_network, strict=False)
+    except ValueError as exc:
+        logger.error(
+            f"Invalid IPv4 network '{loopback_ipv4_network}' for cluster '{cluster_name}': {exc}"
+        )
+        return None
+
+    ipv6_network = None
+    if loopback_ipv6_network:
+        try:
+            ipv6_network = ipaddress.IPv6Network(loopback_ipv6_network, strict=False)
+        except ValueError as exc:
+            logger.error(
+                f"Invalid IPv6 network '{loopback_ipv6_network}' for cluster '{cluster_name}': {exc}"
+            )
+
+    return ClusterConfig(
+        ipv4_network=ipv4_network,
+        ipv6_network=ipv6_network,
+        offset=int(loopback_offset_ipv4 or 0),
+    )
+
+
 def group_devices_by_cluster(
     devices_with_clusters: List[Any],
 ) -> Dict[int, Dict[str, Any]]:
@@ -216,129 +262,95 @@ def calculate_loopback_ips(
         return None, None
 
 
-def generate_cluster_loopback_tasks() -> Dict[str, List[Dict[str, Any]]]:
+def generate_cluster_loopback_tasks(
+    netbox_api: Optional[Any] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
     """Generate loopback IP address assignments for devices with assigned clusters."""
+    api = netbox_api or create_netbox_api()
     tasks_by_type: Dict[str, List[Dict[str, Any]]] = {"ip_address": []}
-    netbox_api = create_netbox_api()
 
     logger.info("Analyzing devices with clusters for loopback IP generation...")
-    all_devices = netbox_api.dcim.devices.all()
+    all_devices = api.dcim.devices.all()
     devices_with_clusters = [device for device in all_devices if device.cluster]
-
     logger.info(f"Found {len(devices_with_clusters)} devices with assigned clusters")
 
-    clusters_dict = group_devices_by_cluster(devices_with_clusters)
-
-    for cluster_id, cluster_data in clusters_dict.items():
+    for cluster_id, cluster_data in group_devices_by_cluster(
+        devices_with_clusters
+    ).items():
         cluster = cluster_data["cluster"]
         devices = cluster_data["devices"]
-
         logger.info(f"Processing cluster '{cluster.name}' with {len(devices)} devices")
-
-        try:
-            config_context = _get_cluster_segment_config_context(
-                netbox_api, cluster_id, cluster.name
-            )
-            if not config_context:
-                logger.warning(
-                    f"Cluster '{cluster.name}' has no config context assigned, skipping loopback generation for {len(devices)} devices"
-                )
-                continue
-
-            loopback_ipv4_network = config_context.get("_segment_loopback_network_ipv4")
-            loopback_ipv6_network = config_context.get("_segment_loopback_network_ipv6")
-            loopback_offset_ipv4 = config_context.get("_segment_loopback_offset_ipv4", 0)
-
-            if not loopback_ipv4_network:
-                logger.info(
-                    f"Cluster '{cluster.name}' has no _segment_loopback_network_ipv4 in config context, skipping"
-                )
-                continue
-
-            logger.debug(
-                f"Cluster '{cluster.name}' config: IPv4={loopback_ipv4_network}, IPv6={loopback_ipv6_network}, offset={loopback_offset_ipv4}"
-            )
-
-            try:
-                ipv4_network = ipaddress.IPv4Network(loopback_ipv4_network, strict=False)
-            except ValueError as exc:
-                logger.error(
-                    f"Invalid IPv4 network '{loopback_ipv4_network}' for cluster '{cluster.name}': {exc}"
-                )
-                continue
-
-            ipv6_network = None
-            if loopback_ipv6_network:
-                try:
-                    ipv6_network = ipaddress.IPv6Network(loopback_ipv6_network, strict=False)
-                except ValueError as exc:
-                    logger.error(
-                        f"Invalid IPv6 network '{loopback_ipv6_network}' for cluster '{cluster.name}': {exc}"
-                    )
-
-            for device in devices:
-                if not should_have_loopback_interface(device):
-                    logger.debug(
-                        f"Skipping cluster loopback IP generation for {device.name} "
-                        f"(does not meet Loopback0 interface criteria)"
-                    )
-                    continue
-
-                ipv4_addr, ipv6_addr = calculate_loopback_ips(
-                    device, ipv4_network, ipv6_network, loopback_offset_ipv4
-                )
-
-                if ipv4_addr:
-                    tasks_by_type["ip_address"].append(
-                        {
-                            "ip_address": {
-                                "address": ipv4_addr,
-                                "assigned_object": {
-                                    "name": "Loopback0",
-                                    "device": device.name,
-                                },
-                            }
-                        }
-                    )
-                    logger.info(
-                        f"Generated IPv4 loopback: {device.name} -> {ipv4_addr}"
-                    )
-
-                if ipv6_addr:
-                    tasks_by_type["ip_address"].append(
-                        {
-                            "ip_address": {
-                                "address": ipv6_addr,
-                                "assigned_object": {
-                                    "name": "Loopback0",
-                                    "device": device.name,
-                                },
-                            }
-                        }
-                    )
-                    logger.info(
-                        f"Generated IPv6 loopback: {device.name} -> {ipv6_addr}"
-                    )
-
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.error(f"Error processing cluster '{cluster.name}': {exc}")
-            continue
+        cluster_tasks = _build_ip_tasks_for_cluster(api, cluster_id, cluster, devices)
+        tasks_by_type["ip_address"].extend(cluster_tasks)
 
     total_tasks = sum(len(tasks) for tasks in tasks_by_type.values())
     logger.info(f"Generated {total_tasks} cluster-based loopback IP assignment tasks")
     return tasks_by_type
 
 
-def generate_device_interface_labels() -> List[Dict[str, Any]]:
+def _build_ip_tasks_for_cluster(
+    api: Any, cluster_id: int, cluster: Any, devices: List[Any]
+) -> List[Dict[str, Any]]:
+    """Build IP tasks for a single cluster."""
+    config_context = _get_cluster_segment_config_context(api, cluster_id, cluster.name)
+    if not config_context:
+        logger.warning(
+            f"Cluster '{cluster.name}' has no config context assigned, skipping loopback generation for {len(devices)} devices"
+        )
+        return []
+
+    config = parse_cluster_config(config_context, cluster.name)
+    if not config:
+        return []
+
+    tasks: List[Dict[str, Any]] = []
+    for device in devices:
+        if not should_have_loopback_interface(device):
+            logger.debug(
+                f"Skipping cluster loopback IP generation for {device.name} "
+                f"(does not meet Loopback0 interface criteria)"
+            )
+            continue
+
+        ipv4_addr, ipv6_addr = calculate_loopback_ips(
+            device, config.ipv4_network, config.ipv6_network, config.offset
+        )
+
+        if ipv4_addr:
+            tasks.append(
+                {
+                    "ip_address": {
+                        "address": ipv4_addr,
+                        "assigned_object": {"name": "Loopback0", "device": device.name},
+                    }
+                }
+            )
+            logger.info(f"Generated IPv4 loopback: {device.name} -> {ipv4_addr}")
+
+        if ipv6_addr:
+            tasks.append(
+                {
+                    "ip_address": {
+                        "address": ipv6_addr,
+                        "assigned_object": {"name": "Loopback0", "device": device.name},
+                    }
+                }
+            )
+            logger.info(f"Generated IPv6 loopback: {device.name} -> {ipv6_addr}")
+
+    return tasks
+
+
+def generate_device_interface_labels(netbox_api: Optional[Any] = None) -> List[Dict[str, Any]]:
     """Generate device interface label tasks based on switch, router, and firewall custom fields."""
-    tasks = []
-    netbox_api = create_netbox_api()
+    tasks: List[Dict[str, Any]] = []
+    api = netbox_api or create_netbox_api()
 
     logger.info(
         "Analyzing switch, router, and firewall devices for device interface labeling..."
     )
 
-    all_devices = netbox_api.dcim.devices.all()
+    all_devices = api.dcim.devices.all()
     devices_with_labels = []
 
     for device in all_devices:
@@ -385,9 +397,7 @@ def generate_device_interface_labels() -> List[Dict[str, Any]]:
                     f"{device_type_name} {source_device.name} has frr_local_pref: {frr_local_pref}"
                 )
 
-        source_interfaces = netbox_api.dcim.interfaces.filter(
-            device_id=source_device.id
-        )
+        source_interfaces = api.dcim.interfaces.filter(device_id=source_device.id)
 
         for interface in source_interfaces:
             if not (
@@ -437,16 +447,16 @@ def generate_device_interface_labels() -> List[Dict[str, Any]]:
     return tasks
 
 
-def generate_portchannel_tasks() -> List[Dict[str, Any]]:
+def generate_portchannel_tasks(netbox_api: Optional[Any] = None) -> List[Dict[str, Any]]:
     """Generate PortChannel configuration tasks for switch-to-switch connections."""
-    lag_creation_tasks = []
-    member_assignment_tasks = []
+    lag_creation_tasks: List[Dict[str, Any]] = []
+    member_assignment_tasks: List[Dict[str, Any]] = []
 
-    netbox_api = create_netbox_api()
+    api = netbox_api or create_netbox_api()
 
     logger.info("Analyzing switch-to-switch connections for PortChannel generation...")
 
-    all_devices = netbox_api.dcim.devices.all()
+    all_devices = api.dcim.devices.all()
     switch_devices = []
 
     for device in all_devices:
@@ -460,7 +470,7 @@ def generate_portchannel_tasks() -> List[Dict[str, Any]]:
     switch_connections: Dict[Tuple[str, str], List[Tuple[Any, Any]]] = {}
 
     for switch in switch_devices:
-        interfaces = netbox_api.dcim.interfaces.filter(device_id=switch.id)
+        interfaces = api.dcim.interfaces.filter(device_id=switch.id)
 
         for interface in interfaces:
             if not (hasattr(interface, "cable") and interface.cable):
@@ -792,7 +802,9 @@ def collect_ip_assignments_by_interface(
     return device_assignments
 
 
-def generate_autoconf_tasks() -> Dict[str, List[Dict[str, Any]]]:
+def generate_autoconf_tasks(
+    netbox_api: Optional[Any] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
     """Generate automatic configuration tasks based on NetBox API data."""
     tasks_by_type: Dict[str, List[Dict[str, Any]]] = {
         "device": [],
@@ -800,11 +812,11 @@ def generate_autoconf_tasks() -> Dict[str, List[Dict[str, Any]]]:
         "ip_address": [],
     }
 
-    netbox_api = create_netbox_api()
+    api = netbox_api or create_netbox_api()
     logger.info("Analyzing NetBox data for automatic configuration...")
 
     logger.info("Loading devices from NetBox...")
-    all_devices = netbox_api.dcim.devices.all()
+    all_devices = api.dcim.devices.all()
     all_devices_dict = {}
     non_switch_devices = {}
 
@@ -820,17 +832,17 @@ def generate_autoconf_tasks() -> Dict[str, List[Dict[str, Any]]]:
     )
 
     logger.info("Collecting interface MAC assignments (including switches)...")
-    interface_tasks = collect_interface_assignments(netbox_api, all_devices_dict)
+    interface_tasks = collect_interface_assignments(api, all_devices_dict)
     tasks_by_type["device_interface"].extend(interface_tasks)
 
     logger.info("Checking for device IP assignments (including switches)...")
 
     oob_assignments = collect_ip_assignments_by_interface(
-        netbox_api, all_devices_dict, "eth0", "OOB"
+        api, all_devices_dict, "eth0", "OOB"
     )
 
     primary_assignments = collect_ip_assignments_by_interface(
-        netbox_api, all_devices_dict, "Loopback0", "Primary"
+        api, all_devices_dict, "Loopback0", "Primary"
     )
 
     all_device_assignments: Dict[str, Dict[str, Any]] = {}
