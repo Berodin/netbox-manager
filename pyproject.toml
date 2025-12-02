@@ -33,8 +33,8 @@ dynamic = ["dependencies", "version"]
 [tool.mypy]
 exclude = ["doc"]
 
-[tool.setuptools]
-packages = ["netbox_manager"]
+[tool.setuptools.packages.find]
+include = ["netbox_manager*"]
 
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}
