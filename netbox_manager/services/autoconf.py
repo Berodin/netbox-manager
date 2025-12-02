@@ -449,197 +449,169 @@ def generate_device_interface_labels(netbox_api: Optional[Any] = None) -> List[D
 
 def generate_portchannel_tasks(netbox_api: Optional[Any] = None) -> List[Dict[str, Any]]:
     """Generate PortChannel configuration tasks for switch-to-switch connections."""
+    api = netbox_api or create_netbox_api()
+    logger.info("Analyzing switch-to-switch connections for PortChannel generation...")
+
+    switch_devices = _load_switches(api)
+    switch_connections = _collect_switch_connections(api, switch_devices)
+    tasks = _build_portchannel_tasks_from_connections(switch_connections)
+    logger.info(f"Generated {len(tasks)} PortChannel LAG interface tasks")
+    return tasks
+
+
+def _load_switches(api: Any) -> List[Any]:
+    """Return list of switch devices."""
+    switches = []
+    for device in api.dcim.devices.all():
+        if get_device_role_slug(device) in NETBOX_SWITCH_ROLES:
+            switches.append(device)
+            logger.debug(f"Found switch: {device.name}")
+    logger.info(f"Found {len(switches)} switch devices")
+    return switches
+
+
+def _collect_switch_connections(api: Any, switches: List[Any]) -> Dict[Tuple[str, str], List[Tuple[Any, Any]]]:
+    """Collect switch-to-switch connections grouped by switch pair."""
+    connections: Dict[Tuple[str, str], List[Tuple[Any, Any]]] = {}
+    for switch in switches:
+        for interface in api.dcim.interfaces.filter(device_id=switch.id):
+            if not _is_cabled_interface(interface):
+                continue
+            for endpoint in interface.connected_endpoints or []:
+                if not _is_switch_endpoint(endpoint):
+                    continue
+                switch_pair = tuple(sorted([switch.name, endpoint.device.name]))
+                connection = (interface, endpoint) if switch.name == switch_pair[0] else (endpoint, interface)
+                _add_unique_connection(connections, switch_pair, connection)
+    return connections
+
+
+def _is_cabled_interface(interface: Any) -> bool:
+    """Check if interface has a cable and endpoints."""
+    return bool(getattr(interface, "cable", None) and getattr(interface, "connected_endpoints", None))
+
+
+def _is_switch_endpoint(endpoint: Any) -> bool:
+    """Return True if endpoint belongs to a switch device."""
+    return bool(hasattr(endpoint, "device") and endpoint.device and get_device_role_slug(endpoint.device) in NETBOX_SWITCH_ROLES)
+
+
+def _add_unique_connection(
+    connections: Dict[Tuple[str, str], List[Tuple[Any, Any]]],
+    switch_pair: Tuple[str, str],
+    connection: Tuple[Any, Any],
+) -> None:
+    """Add connection to dict if not already present."""
+    bucket = connections.setdefault(switch_pair, [])
+    for existing in bucket:
+        if existing[0].id == connection[0].id and existing[1].id == connection[1].id:
+            return
+    bucket.append(connection)
+    logger.debug(
+        f"Found connection: {connection[0].device.name}:{connection[0].name} <-> "
+        f"{connection[1].device.name}:{connection[1].name}"
+    )
+
+
+def _build_portchannel_tasks_from_connections(
+    switch_connections: Dict[Tuple[str, str], List[Tuple[Any, Any]]]
+) -> List[Dict[str, Any]]:
+    """Build LAG creation and member assignment tasks from connections."""
     lag_creation_tasks: List[Dict[str, Any]] = []
     member_assignment_tasks: List[Dict[str, Any]] = []
 
-    api = netbox_api or create_netbox_api()
-
-    logger.info("Analyzing switch-to-switch connections for PortChannel generation...")
-
-    all_devices = api.dcim.devices.all()
-    switch_devices = []
-
-    for device in all_devices:
-        device_role_slug = get_device_role_slug(device)
-        if device_role_slug in NETBOX_SWITCH_ROLES:
-            switch_devices.append(device)
-            logger.debug(f"Found switch: {device.name}")
-
-    logger.info(f"Found {len(switch_devices)} switch devices")
-
-    switch_connections: Dict[Tuple[str, str], List[Tuple[Any, Any]]] = {}
-
-    for switch in switch_devices:
-        interfaces = api.dcim.interfaces.filter(device_id=switch.id)
-
-        for interface in interfaces:
-            if not (hasattr(interface, "cable") and interface.cable):
-                continue
-
-            if not (
-                hasattr(interface, "connected_endpoints")
-                and interface.connected_endpoints
-            ):
-                continue
-
-            for endpoint in interface.connected_endpoints:
-                if not (hasattr(endpoint, "device") and endpoint.device):
-                    continue
-
-                connected_device = endpoint.device
-                connected_role_slug = get_device_role_slug(connected_device)
-
-                if connected_role_slug not in NETBOX_SWITCH_ROLES:
-                    continue
-
-                switch_pair = tuple(sorted([switch.name, connected_device.name]))
-
-                if switch.name == switch_pair[0]:
-                    connection = (interface, endpoint)
-                else:
-                    connection = (endpoint, interface)
-
-                if switch_pair not in switch_connections:
-                    switch_connections[switch_pair] = []
-
-                connection_exists = False
-                for existing_conn in switch_connections[switch_pair]:
-                    if (
-                        existing_conn[0].id == connection[0].id
-                        and existing_conn[1].id == connection[1].id
-                    ):
-                        connection_exists = True
-                        break
-
-                if not connection_exists:
-                    switch_connections[switch_pair].append(connection)
-                    logger.debug(
-                        f"Found connection: {switch.name}:{interface.name} <-> "
-                        f"{connected_device.name}:{endpoint.name}"
-                    )
-
-    for switch_pair in sorted(switch_connections.keys()):
-        connections = switch_connections[switch_pair]
+    for switch_pair, connections in sorted(switch_connections.items()):
         if len(connections) < 2:
             continue
-
         switch1_name, switch2_name = switch_pair
+        switch1_interfaces, switch2_interfaces = _extract_interface_names(connections)
+
+        pch1_name = _portchannel_name_for_interfaces(switch1_interfaces)
+        pch2_name = _portchannel_name_for_interfaces(switch2_interfaces)
         logger.info(
-            f"Processing {len(connections)} connections between "
-            f"{switch1_name} and {switch2_name}"
-        )
-
-        switch1_interfaces = []
-        switch2_interfaces = []
-
-        for interface1, interface2 in connections:
-            switch1_interfaces.append(interface1.name)
-            switch2_interfaces.append(interface2.name)
-
-        switch1_interfaces.sort()
-        switch2_interfaces.sort()
-
-        def extract_portchannel_number(interface_name: str) -> int:
-            numbers = re.findall(r"\d+", interface_name)
-
-            if not numbers:
-                return 0
-
-            if "/" in interface_name and len(numbers) >= 2:
-                return int(numbers[1])
-
-            return int(numbers[0])
-
-        switch1_port_numbers = [
-            extract_portchannel_number(name) for name in switch1_interfaces
-        ]
-        switch1_portchannel_number = (
-            min(switch1_port_numbers) if switch1_port_numbers else 1
-        )
-        switch1_portchannel_name = f"PortChannel{switch1_portchannel_number}"
-
-        switch2_port_numbers = [
-            extract_portchannel_number(name) for name in switch2_interfaces
-        ]
-        switch2_portchannel_number = (
-            min(switch2_port_numbers) if switch2_port_numbers else 1
-        )
-        switch2_portchannel_name = f"PortChannel{switch2_portchannel_number}"
-
-        logger.info(
-            f"Creating {switch1_portchannel_name} on {switch1_name} and {switch2_portchannel_name} on {switch2_name} "
+            f"Creating {pch1_name} on {switch1_name} and {pch2_name} on {switch2_name} "
             f"for {len(connections)} connections"
         )
 
-        lag_creation_tasks.append(
+        lag_creation_tasks.extend(
+            [
+                _lag_task(switch1_name, pch1_name),
+                _lag_task(switch2_name, pch2_name),
+            ]
+        )
+        member_assignment_tasks.extend(
+            _member_tasks(switch1_name, switch1_interfaces, pch1_name)
+            + _member_tasks(switch2_name, switch2_interfaces, pch2_name)
+        )
+
+    lag_creation_tasks.sort(key=_sort_task_key)
+    member_assignment_tasks.sort(key=_sort_task_key)
+    return lag_creation_tasks + member_assignment_tasks
+
+
+def _extract_interface_names(connections: List[Tuple[Any, Any]]) -> Tuple[List[str], List[str]]:
+    """Return sorted interface names for each switch in a pair."""
+    switch1_interfaces = []
+    switch2_interfaces = []
+    for iface1, iface2 in connections:
+        switch1_interfaces.append(iface1.name)
+        switch2_interfaces.append(iface2.name)
+    switch1_interfaces.sort()
+    switch2_interfaces.sort()
+    return switch1_interfaces, switch2_interfaces
+
+
+def _portchannel_name_for_interfaces(interfaces: List[str]) -> str:
+    """Derive PortChannel name from interface list."""
+    numbers = [_extract_port_number(name) for name in interfaces]
+    pc_number = min(numbers) if numbers else 1
+    return f"PortChannel{pc_number}"
+
+
+def _extract_port_number(interface_name: str) -> int:
+    """Extract numeric portion to pick PortChannel ID."""
+    nums = re.findall(r"\d+", interface_name)
+    if not nums:
+        return 0
+    if "/" in interface_name and len(nums) >= 2:
+        return int(nums[1])
+    return int(nums[0])
+
+
+def _lag_task(device: str, lag_name: str) -> Dict[str, Any]:
+    """Build a LAG creation task."""
+    return {
+        "device_interface": {
+            "device": device,
+            "name": lag_name,
+            "type": "lag",
+            "tags": ["managed-by-osism"],
+        }
+    }
+
+
+def _member_tasks(device: str, interfaces: List[str], lag_name: str) -> List[Dict[str, Any]]:
+    """Build member assignment tasks for a device."""
+    tasks = []
+    for iface in interfaces:
+        tasks.append(
             {
                 "device_interface": {
-                    "device": switch1_name,
-                    "name": switch1_portchannel_name,
-                    "type": "lag",
+                    "device": device,
+                    "name": iface,
+                    "lag": lag_name,
                     "tags": ["managed-by-osism"],
                 }
             }
         )
-        logger.info(
-            f"Will create LAG interface: {switch1_name}:{switch1_portchannel_name}"
-        )
-
-        lag_creation_tasks.append(
-            {
-                "device_interface": {
-                    "device": switch2_name,
-                    "name": switch2_portchannel_name,
-                    "type": "lag",
-                    "tags": ["managed-by-osism"],
-                }
-            }
-        )
-        logger.info(
-            f"Will create LAG interface: {switch2_name}:{switch2_portchannel_name}"
-        )
-
-        for interface_name in switch1_interfaces:
-            member_assignment_tasks.append(
-                {
-                    "device_interface": {
-                        "device": switch1_name,
-                        "name": interface_name,
-                        "lag": switch1_portchannel_name,
-                        "tags": ["managed-by-osism"],
-                    }
-                }
-            )
-            logger.info(
-                f"Will assign member to LAG: {switch1_name}:{interface_name} -> {switch1_portchannel_name}"
-            )
-
-        for interface_name in switch2_interfaces:
-            member_assignment_tasks.append(
-                {
-                    "device_interface": {
-                        "device": switch2_name,
-                        "name": interface_name,
-                        "lag": switch2_portchannel_name,
-                        "tags": ["managed-by-osism"],
-                    }
-                }
-            )
-            logger.info(
-                f"Will assign member to LAG: {switch2_name}:{interface_name} -> {switch2_portchannel_name}"
-            )
-
-    def sort_key(task):
-        iface = task["device_interface"]
-        return (iface["device"], iface["name"])
-
-    lag_creation_tasks.sort(key=sort_key)
-    member_assignment_tasks.sort(key=sort_key)
-
-    tasks = lag_creation_tasks + member_assignment_tasks
-
-    logger.info(f"Generated {len(tasks)} PortChannel LAG interface tasks")
+        logger.info(f"Will assign member to LAG: {device}:{iface} -> {lag_name}")
     return tasks
+
+
+def _sort_task_key(task: Dict[str, Any]) -> Tuple[str, str]:
+    """Sorting helper for deterministic ordering."""
+    iface = task["device_interface"]
+    return (iface["device"], iface["name"])
 
 
 def split_tasks_by_type(
